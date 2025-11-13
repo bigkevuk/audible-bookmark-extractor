@@ -32,10 +32,10 @@ Currently, the tool supports exporting to Excel and [Readwise](https://readwise.
 
 ## PDF Search
 
-- Store companion PDFs within each audiobook directory (e.g., `~/audible-bookmark-extractor/audiobooks/<book_title>/pdf/book.pdf`). A global `~/audible-bookmark-extractor/pdf` fallback is still supported.
-- After transcribing, run `search_pdf` to list your books, choose one, and automatically map every clip transcription (`extracted text/*.txt`) to the most likely PDF page. Results are saved to `extracted text/clip_pdf_references.json`.
+- Store companion PDFs/EPUBs within each audiobook directory (e.g., `~/audible-bookmark-extractor/audiobooks/<book_title>/pdf` or `.../epub`). A global `~/audible-bookmark-extractor/pdf` directory can also hold either format.
+- After transcribing, run `search_pdf` to list your books, choose one, and map every clip transcription to the best matching EPUB section (when available) and PDF page. Results are saved to `<book_root>/clip_pdf_references.json`, and processed transcription files move into `extracted text/processed/`.
 - You can still run ad-hoc lookups with `search_pdf --query="some text"` (optional `--threshold` and `--max_results`) to print the top fuzzy matches.
-- PDFs are cached after the first scan, so repeated searches stay fast until the PDF changes.
+- Documents are cached after the first scan, so repeated searches stay fast until the source files change.
 
 ## Authentication
 

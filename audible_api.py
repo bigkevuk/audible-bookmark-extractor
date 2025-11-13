@@ -6,6 +6,8 @@ import requests
 import shutil
 import re
 import hashlib
+import zipfile
+from html.parser import HTMLParser
 from difflib import SequenceMatcher
 from getpass import getpass
 
@@ -65,6 +67,7 @@ class AudibleAPI:
         self.books = []
         self.library = {}
         self._pdf_cache = {}
+        self._epub_cache = {}
         self._library_cache_path = os.path.join(os.path.dirname(__file__), "library_cache.json")
         self._load_library_cache()
 
@@ -114,35 +117,40 @@ class AudibleAPI:
                 print(e)
 
     # Helper function for displaying the users books and allowing them to select one based on the index number
-    async def get_book_selection(self):
-
-        if not self.library.get("items"):
-            await self.get_library()
-
-        items = self.library.get("items", [])
-        li_books = [{"title": book, "asin": book.get("asin")} for book in items]
-        for index, book in enumerate(items):
-            book_title = book.get("title", "Unable to retrieve book name")
-            print(f"{index}: {book_title}")
-
-        book_selection = input(
-            "Enter the index number of the book you would like to download, or enter --all for all available books: \n")
-
-        if book_selection == "--all":
-            return [{"title": book.get("title", 'untitled'), "asin": book.get("asin")}
-                    for book in items]
-
+    async def get_book_selection(self, source="library"):
+        if source == "library":
+            items = self.library.get("items", [])
+            if not items:
+                print("No cached Audible library available. Run list_books to refresh it from Audible.")
+                return []
+            selection_pool = items
         else:
-            try:
-                selected = li_books[int(book_selection)]
-                return [selected]
-            except (IndexError, ValueError):
-                print("Invalid selection")                
-        return []
+            selection_pool = self._get_downloaded_books()
+            if not selection_pool:
+                print(f"No downloaded audiobooks found under {os.path.join(artifacts_root_directory, 'audiobooks')}.")
+                return []
+
+        for index, book in enumerate(selection_pool):
+            print(f"{index}: {self._get_display_title(book)}")
+
+        selection = input(
+            "Enter the index number of the book you would like to use, or enter --all for all available books: \n")
+
+        if selection == "--all":
+            return list(selection_pool)
+
+        try:
+            chosen = selection_pool[int(selection)]
+            return [chosen]
+        except (IndexError, ValueError):
+            print("Invalid selection")
+            return []
 
     # Main download books function
     async def cmd_download_books(self):
-        li_books = await self.get_book_selection()
+        li_books = await self.get_book_selection(source="library")
+        if not li_books:
+            return
 
         tasks = []
         for book in li_books:
@@ -229,9 +237,7 @@ class AudibleAPI:
             return library.url
 
     async def cmd_list_books(self):
-        if not self.books:
-            await self.cmd_show_library()
-
+        await self.get_library(force_refresh=True)
         await self.cmd_show_library()
         
     # Gets all books and info for account and adds it to self.books, also returns ASIN for all books
@@ -259,38 +265,44 @@ class AudibleAPI:
             return asins
 
     async def cmd_show_library(self):
-        if not self.books:
-            await self.get_library()
-
-        for index, book_title in enumerate(self.books):
-            print(f"{index}: {book_title}")
+        if not self.library.get("items"):
+            print("Library cache is empty. Run list_books to refresh from Audible.")
+            return
+        for index, book in enumerate(self.library.get("items", [])):
+            print(f"{index}: {self._get_display_title(book)}")
     
     async def cmd_refresh_library(self):
         print("Refreshing library cache from Audible...")
         await self.get_library(force_refresh=True)
-        print(f"Cached {len(self.books)} books locally.")
+        print(f"Cached {len(self.library.get('items', []))} books locally.")
    
 
     async def cmd_get_bookmarks(self):
-        li_books = await self.get_book_selection()
+        li_books = await self.get_book_selection(source="local")
+        if not li_books:
+            return
 
         for book in li_books:
             print(self.get_bookmarks(book))
 
     def get_bookmarks(self, book):
         asin = book.get("asin")
-        _title = book.get("title", {}).get("title", 'untitled')
+        _title = self._get_display_title(book)
         if not _title:
             return
 
-        title = _title.lower().replace(" ", "_")
+        title_slug, title_dir_path = self._ensure_local_book_path(book)
+        title = title_slug
 
-        bookmarks_dir = os.path.join(artifacts_root_directory, "audiobooks", title, "bookmarks")
+        bookmarks_dir = os.path.join(title_dir_path, "bookmarks")
         os.makedirs(bookmarks_dir, exist_ok=True)
         bookmarks_path = os.path.join(bookmarks_dir, "bookmarks.json")
 
         li_bookmarks = self._load_bookmarks_from_disk(bookmarks_path)
         if li_bookmarks is None:
+            if not asin:
+                print(f"No ASIN cached for '{_title}'. Run list_books to refresh the library cache before fetching bookmarks.")
+                return
             bookmarks_url = f"https://cde-ta-g7g.amazon.com/FionaCDEServiceEngine/sidecar?type=AUDI&key={asin}"
             print(f"Fetching bookmarks from Audible for {_title}")
             try:
@@ -318,7 +330,6 @@ class AudibleAPI:
             return
         print(f"Preparing {total_clip_entries} clips for {_title}...")
 
-        title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
         title_aax_path = os.path.join(title_dir_path, f"{title}.aax")
         title_m4b_path = os.path.join(title_dir_path, f"{title}.m4b")
         title_mp3_path = os.path.join(title_dir_path, f"{title}.mp3")
@@ -329,9 +340,10 @@ class AudibleAPI:
         file_counter = 1
         processed_clips = 0
         notes_dict = {}
+        clip_metadata_records = []
 
         # Check whether a folder in clips/ for the book exists or not
-        clips_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title, "clips")
+        clips_dir_path = os.path.join(title_dir_path, "clips")
         path_exists = os.path.exists(clips_dir_path)
         if not path_exists:
             os.makedirs(clips_dir_path)
@@ -371,21 +383,30 @@ class AudibleAPI:
             clip.export(clip_path, format="flac")
             file_counter += 1
 
+            clip_metadata_records.append({
+                "file_name": file_name,
+                "startPosition": raw_start_pos,
+                "endPosition": clip_entry.get("endPosition"),
+                "note": note_name
+            })
+
+        self._save_clip_metadata(clips_dir_path, clip_metadata_records)
+
     async def cmd_convert_audiobook(self):
         # FFMPEG needs to be installed for this step! see readme for more details
-        li_books = await self.get_book_selection()
+        li_books = await self.get_book_selection(source="local")
+        if not li_books:
+            return
 
         for book in li_books:
-            asin = book.get("asin")
-            # Weird for some reason the title is doubled nested here, fix later
-            _title = book.get("title", {}).get("title", {})
+            # Weird for some reason the title is double nested here, fix later
+            _title = self._get_display_title(book)
             if not _title:
                 return
 
-            title = _title.replace(" ", "_").lower()
+            title, title_dir_path = self._ensure_local_book_path(book)
             # Strips Audible DRM  from audiobook
             activation_bytes = self.get_activation_bytes()
-            title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
             title_aax_path = os.path.join(title_dir_path, f"{title}.aax")
             title_m4b_path = os.path.join(title_dir_path, f"{title}.m4b")
             title_mp3_path = os.path.join(title_dir_path, f"{title}.mp3")
@@ -397,7 +418,9 @@ class AudibleAPI:
                 f"ffmpeg -i {title_m4b_path} {title_mp3_path}")
 
     async def cmd_transcribe_bookmarks(self, openai_api_key=None, whisper_mode=None, whisper_model=None, whisper_device=None):
-        li_books = await self.get_book_selection()
+        li_books = await self.get_book_selection(source="local")
+        if not li_books:
+            return
 
         global pd
         if pd is None:
@@ -491,11 +514,10 @@ class AudibleAPI:
         
         for book in li_books:
 
-            _title = book.get("title", {}).get("title", {})
+            _title = self._get_display_title(book)
             _authors = book.get("title", {}).get("authors", {})
             allAuthors = ", ".join(item['name'] for item in _authors)
-            title = _title.lower().replace(" ", "_")
-            title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
+            title, title_dir_path = self._ensure_local_book_path(book)
             clips_dir_path = os.path.join(title_dir_path, "clips")
             path_exists = os.path.exists(clips_dir_path)
             if not path_exists:
@@ -513,6 +535,7 @@ class AudibleAPI:
             extracted_text_dir_path = os.path.join(title_dir_path, "extracted text")
             if not os.path.exists(extracted_text_dir_path):
                 os.makedirs(extracted_text_dir_path)
+            clip_metadata_map = self._load_clip_metadata_map(title_dir_path)
 
             clip_files = sorted(
                 [file for file in os.listdir(clips_dir_path) if file.endswith(".flac")]
@@ -619,9 +642,16 @@ class AudibleAPI:
                         os.remove(processed_file_path)
                     shutil.move(clip_full_path, processed_file_path)
 
-                    extracted_text_file_path = os.path.join(extracted_text_dir_path, f"{heading}.txt")
+                    extracted_text_file_path = os.path.join(extracted_text_dir_path, f"{heading}.json")
+                    bookmark_meta = clip_metadata_map.get(heading, {})
+                    clip_payload = {
+                        "clip": heading,
+                        "text": text,
+                        "startPosition": bookmark_meta.get("startPosition"),
+                        "endPosition": bookmark_meta.get("endPosition")
+                    }
                     with open(extracted_text_file_path, "w", encoding="utf-8") as text_file:
-                        text_file.write(text)
+                        json.dump(clip_payload, text_file, ensure_ascii=False, indent=2)
             transcription_contents_path = os.path.join(transcribed_clips_dir_path, "contents.json")
             with open(transcription_contents_path, "w") as f:
                 json.dump(jsonHighlights, f, indent=4)
@@ -642,34 +672,40 @@ class AudibleAPI:
             print("Invalid max_results supplied; expected an integer.")
             return
 
-        li_books = await self.get_book_selection()
+        li_books = await self.get_book_selection(source="local")
+        if not li_books:
+            return
         for book in li_books:
-            raw_title = book.get("title", {}).get("title") or book.get("title", "untitled")
+            raw_title = self._get_display_title(book)
             normalized_title = raw_title.strip() if isinstance(raw_title, str) else "untitled"
-            title_slug = normalized_title.lower().replace(" ", "_")
-            title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title_slug)
-            pdf_path = self._resolve_pdf_path(normalized_title, title_dir_path)
+            title_slug, title_dir_path = self._ensure_local_book_path(book)
+            documents = self._resolve_document_paths(normalized_title, title_dir_path)
+            pdf_paths = documents.get("pdf", [])
+            epub_paths = documents.get("epub", [])
 
-            if not pdf_path:
-                print(f"No PDF found for '{normalized_title}'. Expected it under {title_dir_path}/pdf or the global pdf directory.")
+            if not pdf_paths and not epub_paths:
+                print(f"No PDF or EPUB found for '{normalized_title}'. Expected files under {title_dir_path}/pdf or the global pdf directory.")
                 continue
 
             if clip_mode:
-                print(f"\nMapping clip transcriptions for '{normalized_title}' using {pdf_path}...")
-                self._map_clips_to_pdf(title_dir_path, pdf_path, threshold_value)
+                doc_labels = []
+                if epub_paths:
+                    doc_labels.append(f"{len(epub_paths)} EPUB")
+                if pdf_paths:
+                    doc_labels.append(f"{len(pdf_paths)} PDF")
+                label_text = " and ".join(doc_labels)
+                print(f"\nMapping clip transcriptions for '{normalized_title}' using {label_text} document(s)...")
+                self._map_clips_to_documents(title_dir_path, pdf_paths, epub_paths, threshold_value)
             else:
-                print(f"\nSearching '{normalized_title}' ({pdf_path}) for '{query_value}'...")
-                matches = self.fuzzy_search_pdf(pdf_path, query_value, threshold_value, max_results_value)
-
-                if not matches:
-                    print(f"No matches found for '{query_value}' in '{normalized_title}'.")
-                    continue
-
-                for idx, match in enumerate(matches, start=1):
-                    snippet = match["snippet"]
-                    score = match["score"]
-                    page = match["page"]
-                    print(f"{idx}. [page {page}, score {score:.2f}] {snippet}")
+                print(f"\nSearching '{normalized_title}' for '{query_value}'...")
+                if epub_paths:
+                    for epub_doc in epub_paths:
+                        matches = self.fuzzy_search_epub(epub_doc, query_value, threshold_value, max_results_value)
+                        self._print_document_matches("EPUB", epub_doc, matches, query_value)
+                if pdf_paths:
+                    for pdf_doc in pdf_paths:
+                        matches = self.fuzzy_search_pdf(pdf_doc, query_value, threshold_value, max_results_value)
+                        self._print_document_matches("PDF", pdf_doc, matches, query_value)
 
     def get_activation_bytes(self):
 
@@ -710,6 +746,15 @@ class AudibleAPI:
         except OSError as exc:
             print(f"Failed to write bookmark metadata: {exc}")
 
+    def _save_clip_metadata(self, clips_dir_path, metadata):
+        metadata_path = os.path.join(clips_dir_path, "clip_metadata.json")
+        try:
+            with open(metadata_path, "w", encoding="utf-8") as meta_file:
+                json.dump(metadata, meta_file, indent=2, ensure_ascii=False)
+            print(f"Saved clip metadata to {metadata_path}")
+        except OSError as exc:
+            print(f"Failed to write clip metadata: {exc}")
+
     def fuzzy_search_pdf(self, pdf_path, query, threshold=0.6, max_results=5):
         query_clean = query.strip()
         if not query_clean:
@@ -733,7 +778,33 @@ class AudibleAPI:
         matches.sort(key=lambda item: item["score"], reverse=True)
         return matches[:max_results]
 
-    def _map_clips_to_pdf(self, title_dir_path, pdf_path, threshold):
+    def fuzzy_search_epub(self, epub_path, query, threshold=0.6, max_results=5):
+        query_clean = query.strip()
+        if not query_clean:
+            return []
+
+        sections = self._get_cached_epub_sections(epub_path)
+        if sections is None:
+            return []
+
+        matches = []
+        query_lower = query_clean.lower()
+        for section in sections:
+            snippet = self._extract_context_snippet(section["text"], query_lower)
+            ratio = SequenceMatcher(None, query_lower, snippet.lower()).ratio()
+            if query_lower in section["text"].lower():
+                ratio = 1.0
+            if ratio >= threshold:
+                matches.append({
+                    "location": section["location"],
+                    "score": ratio,
+                    "snippet": snippet
+                })
+
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches[:max_results]
+
+    def _map_clips_to_documents(self, title_dir_path, pdf_paths, epub_paths, threshold):
         extracted_text_dir_path = os.path.join(title_dir_path, "extracted text")
         if not os.path.isdir(extracted_text_dir_path):
             print(f"No extracted text directory found for this book at {extracted_text_dir_path}.")
@@ -744,40 +815,60 @@ class AudibleAPI:
             print(f"No clip transcription files were found in {extracted_text_dir_path}.")
             return
 
-        pages_text = self._get_cached_pdf_pages(pdf_path)
-        if pages_text is None:
-            return
-
         references = []
         total_clips = len(clip_texts)
-        output_path = os.path.join(extracted_text_dir_path, "clip_pdf_references.json")
+        processed_text_dir_path = os.path.join(extracted_text_dir_path, "processed")
+        os.makedirs(processed_text_dir_path, exist_ok=True)
+        output_path = os.path.join(title_dir_path, "clip_pdf_references.json")
 
-        for index, (clip_name, clip_text) in enumerate(clip_texts, start=1):
+        for index, (clip_name, clip_text, clip_path, start_position, end_position) in enumerate(clip_texts, start=1):
             print(f"Processing clip {index}/{total_clips}: {clip_name}")
-            if not clip_text.strip():
-                references.append({
-                    "clip": clip_name,
-                    "matched": False,
-                    "reason": "Transcription is empty."
-                })
-            else:
-                match = self._best_pdf_match(pages_text, clip_text, threshold)
-                if match:
-                    references.append({
-                        "clip": clip_name,
-                        "matched": True,
-                        "pdf_page": match["page"],
-                        "score": round(match["score"], 3),
-                        "snippet": match["snippet"]
-                    })
+            cleaned_text = clip_text.strip()
+            entry = {
+                "clip": clip_name,
+                "clip_text": cleaned_text,
+                "bookmark_start_ms": start_position,
+                "bookmark_end_ms": end_position,
+                "references": {}
+            }
+
+            if not cleaned_text:
+                reason = "Transcription is empty."
+                if epub_paths:
+                    entry["references"]["epub"] = {"matched": False, "reason": reason}
                 else:
-                    references.append({
-                        "clip": clip_name,
-                        "matched": False,
-                        "reason": f"No PDF location exceeded similarity threshold {threshold}."
-                    })
+                    entry["references"]["epub"] = {"matched": False, "reason": "No EPUB documents available."}
+                if pdf_paths:
+                    entry["references"]["pdf"] = {"matched": False, "reason": reason}
+                else:
+                    entry["references"]["pdf"] = {"matched": False, "reason": "No PDF documents available."}
+                references.append(entry)
+                self._write_clip_reference_summary(output_path, references)
+                self._move_processed_text(clip_path, processed_text_dir_path)
+                continue
+
+            pdf_query_text = cleaned_text
+            pdf_threshold = threshold
+
+            if epub_paths:
+                epub_match = self._match_clip_against_epub(epub_paths, cleaned_text, threshold)
+                entry["references"]["epub"] = epub_match
+                if epub_match.get("matched"):
+                    pdf_query_text = epub_match.get("snippet") or cleaned_text
+                    pdf_threshold = max(threshold, 0.5)
+            else:
+                entry["references"]["epub"] = {"matched": False, "reason": "No EPUB documents available."}
+
+            if pdf_paths:
+                pdf_match = self._match_clip_against_pdfs(pdf_paths, pdf_query_text, pdf_threshold)
+                entry["references"]["pdf"] = pdf_match
+            else:
+                entry["references"]["pdf"] = {"matched": False, "reason": "No PDF documents available."}
+
+            references.append(entry)
 
             self._write_clip_reference_summary(output_path, references)
+            self._move_processed_text(clip_path, processed_text_dir_path)
 
         print(f"Wrote clip reference summary to {output_path}")
 
@@ -787,6 +878,20 @@ class AudibleAPI:
                 json.dump(references, output_file, indent=2, ensure_ascii=False)
         except OSError as exc:
             print(f"Failed to write clip reference summary: {exc}")
+
+    def _print_document_matches(self, doc_type, doc_path, matches, query_value):
+        doc_label = f"{doc_type} ({doc_path})"
+        if not matches:
+            print(f"{doc_label}: no matches for '{query_value}'.")
+            return
+        print(f"{doc_label}:")
+        for idx, match in enumerate(matches, start=1):
+            location = match.get("page")
+            if location is None:
+                location = match.get("location", "N/A")
+            score = match.get("score", 0)
+            snippet = match.get("snippet", "")
+            print(f"  {idx}. [location {location}, score {score:.2f}] {snippet}")
 
     def _combine_overlapping_bookmarks(self, li_bookmarks):
         clip_types = {"audible.clip", "audible.bookmark"}
@@ -838,21 +943,103 @@ class AudibleAPI:
             print(f"Unable to read extracted text directory {extracted_text_dir_path}: {exc}")
             return clip_texts
 
+        metadata_map = self._load_clip_metadata_map(os.path.dirname(extracted_text_dir_path))
+
         for file_name in files:
-            if not file_name.lower().endswith(".txt"):
-                continue
             file_path = os.path.join(extracted_text_dir_path, file_name)
-            try:
-                with open(file_path, "r", encoding="utf-8") as clip_file:
-                    text = clip_file.read()
-            except OSError as exc:
-                print(f"Failed to read {file_path}: {exc}")
+            base, ext = os.path.splitext(file_name)
+            ext_lower = ext.lower()
+            if ext_lower == ".json":
+                try:
+                    with open(file_path, "r", encoding="utf-8") as clip_file:
+                        data = json.load(clip_file)
+                    text = data.get("text", "")
+                    start_position = data.get("startPosition")
+                    end_position = data.get("endPosition")
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"Failed to read {file_path}: {exc}")
+                    continue
+            elif ext_lower == ".txt":
+                try:
+                    with open(file_path, "r", encoding="utf-8") as clip_file:
+                        text = clip_file.read()
+                except OSError as exc:
+                    print(f"Failed to read {file_path}: {exc}")
+                    continue
+                meta = metadata_map.get(base, {})
+                start_position = meta.get("startPosition")
+                end_position = meta.get("endPosition")
+            else:
                 continue
 
-            clip_name = os.path.splitext(file_name)[0]
-            clip_texts.append((clip_name, text))
+            clip_texts.append((base, text, file_path, start_position, end_position))
 
         return clip_texts
+
+    def _move_processed_text(self, source_path, processed_dir_path):
+        if not os.path.exists(source_path):
+            return
+        dest_path = os.path.join(processed_dir_path, os.path.basename(source_path))
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            shutil.move(source_path, dest_path)
+        except OSError as exc:
+            print(f"Failed to move processed text file {source_path}: {exc}")
+
+    def _match_clip_against_epub(self, epub_paths, query_text, threshold):
+        query_clean = query_text.strip()
+        if not query_clean:
+            return {"matched": False, "reason": "Transcription is empty."}
+
+        best_match = None
+        for epub_path in epub_paths:
+            sections = self._get_cached_epub_sections(epub_path)
+            if not sections:
+                continue
+            match = self._best_epub_match(sections, query_clean, threshold)
+            if match:
+                match["path"] = epub_path
+                if best_match is None or match["score"] > best_match["score"]:
+                    best_match = match
+
+        if best_match:
+            return {
+                "matched": True,
+                "path": best_match["path"],
+                "location": best_match["location"],
+                "score": round(best_match["score"], 3),
+                "snippet": best_match["snippet"]
+            }
+
+        return {"matched": False, "reason": f"No EPUB location exceeded similarity threshold {threshold}."}
+
+    def _match_clip_against_pdfs(self, pdf_paths, query_text, threshold):
+        query_clean = query_text.strip()
+        if not query_clean:
+            return {"matched": False, "reason": "Transcription is empty."}
+
+        best_match = None
+        for pdf_path in pdf_paths:
+            pages_text = self._get_cached_pdf_pages(pdf_path)
+            if pages_text is None:
+                continue
+            match = self._best_pdf_match(pages_text, query_clean, threshold)
+            if match:
+                match["path"] = pdf_path
+                if best_match is None or match["score"] > best_match["score"]:
+                    best_match = match
+
+        if best_match:
+            return {
+                "matched": True,
+                "path": best_match["path"],
+                "page": best_match["page"],
+                "score": round(best_match["score"], 3),
+                "snippet": best_match["snippet"]
+            }
+
+        return {"matched": False, "reason": f"No PDF location exceeded similarity threshold {threshold}."}
 
     def _best_pdf_match(self, pages_text, query, threshold):
         query_clean = query.strip()
@@ -874,6 +1061,39 @@ class AudibleAPI:
 
         return best_match
 
+    def _best_epub_match(self, sections, query, threshold):
+        query_clean = query.strip()
+        if not query_clean:
+            return None
+
+        best_match = None
+        query_lower = query_clean.lower()
+
+        for section in sections:
+            text = section["text"]
+            lower_text = text.lower()
+            snippet = self._extract_context_snippet(text, query_lower)
+            ratio = SequenceMatcher(None, query_lower, snippet.lower()).ratio()
+            if query_lower in lower_text:
+                ratio = 1.0
+            if ratio >= threshold and (best_match is None or ratio > best_match["score"]):
+                best_match = {
+                    "location": section["location"],
+                    "snippet": snippet,
+                    "score": ratio
+                }
+
+        return best_match
+
+    def _extract_context_snippet(self, text, query_lower, window=150):
+        lower_text = text.lower()
+        idx = lower_text.find(query_lower)
+        if idx == -1:
+            return text[:window].strip()
+        start = max(idx - window // 2, 0)
+        end = min(idx + len(query_lower) + window // 2, len(text))
+        return text[start:end].strip()
+
     def _split_text_snippets(self, text):
         normalized = re.sub(r"\s+", " ", text).strip()
         if not normalized:
@@ -885,27 +1105,55 @@ class AudibleAPI:
             return [normalized]
         return snippets
 
-    def _resolve_pdf_path(self, book_title, title_dir_path=None):
+    def _resolve_document_paths(self, book_title, title_dir_path=None):
         normalized_key = self._normalized_key(book_title)
 
         search_directories = []
         if title_dir_path:
-            search_directories.append(os.path.join(title_dir_path, "pdf"))
+            search_directories.extend([
+                os.path.join(title_dir_path, "pdf"),
+                os.path.join(title_dir_path, "epub"),
+                title_dir_path
+            ])
 
         pdf_root = os.path.join(artifacts_root_directory, "pdf")
-        search_directories.append(pdf_root)
+        if pdf_root not in search_directories:
+            search_directories.append(pdf_root)
+
+        epub_root = os.path.join(artifacts_root_directory, "epub")
+        if epub_root not in search_directories:
+            search_directories.append(epub_root)
+
+        doc_map = {"pdf": [], "epub": []}
+        seen_paths = set()
 
         for folder in search_directories:
             if not os.path.isdir(folder):
                 continue
             for file_name in os.listdir(folder):
-                if not file_name.lower().endswith(".pdf"):
+                base, ext = os.path.splitext(file_name)
+                ext_lower = ext.lower()
+                if ext_lower not in [".pdf", ".epub"]:
                     continue
-                key = self._normalized_key(os.path.splitext(file_name)[0])
-                if key == normalized_key:
-                    return os.path.join(folder, file_name)
+                key = self._normalized_key(base)
+                if key != normalized_key:
+                    continue
+                full_path = os.path.join(folder, file_name)
+                abs_path = os.path.abspath(full_path)
+                if abs_path in seen_paths:
+                    continue
+                seen_paths.add(abs_path)
+                if ext_lower == ".pdf":
+                    doc_map["pdf"].append(full_path)
+                else:
+                    doc_map["epub"].append(full_path)
 
-        return None
+        return doc_map
+
+    def _resolve_pdf_path(self, book_title, title_dir_path=None):
+        documents = self._resolve_document_paths(book_title, title_dir_path)
+        pdf_paths = documents.get("pdf", [])
+        return pdf_paths[0] if pdf_paths else None
 
     def _normalized_key(self, value):
         if not isinstance(value, str):
@@ -935,6 +1183,87 @@ class AudibleAPI:
         except OSError as exc:
             print(f"Unable to write library cache: {exc}")
 
+    def _slugify_title(self, title):
+        if not title:
+            return "untitled"
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        return slug or "untitled"
+
+    def _normalize_title_field(self, title_field):
+        if isinstance(title_field, dict):
+            return title_field
+        if isinstance(title_field, str):
+            return {"title": title_field}
+        return {"title": "Untitled"}
+
+    def _get_display_title(self, book):
+        title_field = book.get("title")
+        if isinstance(title_field, dict):
+            return title_field.get("title") or title_field.get("name") or "Untitled"
+        if isinstance(title_field, str):
+            return title_field or "Untitled"
+        return "Untitled"
+
+    def _get_downloaded_books(self):
+        audiobooks_root = os.path.join(artifacts_root_directory, "audiobooks")
+        if not os.path.isdir(audiobooks_root):
+            return []
+
+        cache_map = {}
+        for item in self.library.get("items", []):
+            normalized_title = self._get_display_title(item)
+            slug = self._slugify_title(normalized_title)
+            cache_map[slug] = item
+
+        downloaded = []
+        for entry in sorted(os.listdir(audiobooks_root)):
+            entry_path = os.path.join(audiobooks_root, entry)
+            if not os.path.isdir(entry_path):
+                continue
+
+            cached_item = cache_map.get(entry)
+            if cached_item:
+                title_info = self._normalize_title_field(cached_item.get("title"))
+                asin = cached_item.get("asin")
+            else:
+                title_info = {"title": entry.replace("_", " ").title()}
+                asin = None
+
+            downloaded.append({
+                "slug": entry,
+                "title_dir": entry_path,
+                "asin": asin,
+                "title": title_info
+            })
+
+        return downloaded
+
+    def _ensure_local_book_path(self, book):
+        slug = book.get("slug")
+        if not slug:
+            slug = self._slugify_title(self._get_display_title(book))
+        title_dir = book.get("title_dir") or os.path.join(artifacts_root_directory, "audiobooks", slug)
+        return slug, title_dir
+
+    def _load_clip_metadata_map(self, title_dir_path):
+        clips_dir_path = os.path.join(title_dir_path, "clips")
+        metadata_path = os.path.join(clips_dir_path, "clip_metadata.json")
+        if not os.path.exists(metadata_path):
+            return {}
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as meta_file:
+                records = json.load(meta_file)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        metadata_map = {}
+        for record in records:
+            file_name = record.get("file_name")
+            if not file_name:
+                continue
+            metadata_map[file_name] = record
+        return metadata_map
+
     def _get_cached_pdf_pages(self, pdf_path):
         abs_path = os.path.abspath(pdf_path)
         try:
@@ -955,6 +1284,74 @@ class AudibleAPI:
             "pages": pages,
             "last_modified": last_modified
         }
+        return pages
+
+    def _get_cached_epub_sections(self, epub_path):
+        abs_path = os.path.abspath(epub_path)
+        try:
+            last_modified = os.path.getmtime(abs_path)
+        except OSError as exc:
+            print(f"Unable to access EPUB at {epub_path}: {exc}")
+            return None
+
+        cache_entry = self._epub_cache.get(abs_path)
+        if cache_entry and cache_entry.get("last_modified") == last_modified:
+            return cache_entry.get("sections")
+
+        sections = self._extract_epub_sections(abs_path)
+        self._epub_cache[abs_path] = {
+            "sections": sections,
+            "last_modified": last_modified
+        }
+        return sections
+
+    def _extract_epub_sections(self, epub_path):
+        sections = []
+        try:
+            with zipfile.ZipFile(epub_path, "r") as zf:
+                for file_name in zf.namelist():
+                    if not file_name.lower().endswith((".xhtml", ".html", ".htm")):
+                        continue
+                    try:
+                        data = zf.read(file_name).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    text = self._strip_html(data)
+                    clean_text = re.sub(r"\s+", " ", text).strip()
+                    if clean_text:
+                        sections.append({
+                            "text": clean_text,
+                            "location": file_name,
+                            "source": epub_path
+                        })
+        except (OSError, zipfile.BadZipFile) as exc:
+            print(f"Unable to read EPUB at {epub_path}: {exc}")
+        return sections
+
+    def _strip_html(self, html_text):
+        stripper = _HTMLStripper()
+        try:
+            stripper.feed(html_text)
+        except Exception:
+            pass
+        return stripper.get_data()
+
+    def _extract_pdf_pages(self, pdf_path):
+        pages = []
+        try:
+            reader = PdfReader(pdf_path)
+        except Exception as exc:
+            print(f"Unable to read PDF at {pdf_path}: {exc}")
+            return None
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception as exc:
+                print(f"Failed to extract text from page {page_number}: {exc}")
+                page_text = ""
+            pages.append(page_text)
+
         return pages
 
     def _locate_whisper_weights(self, snapshot_root, model_name):
@@ -1015,3 +1412,18 @@ class AudibleAPI:
             pages.append(page_text)
 
         return pages
+
+
+class _HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.reset()
+        self.strict = False
+        self.convert_charrefs = True
+        self._chunks = []
+
+    def handle_data(self, data):
+        self._chunks.append(data)
+
+    def get_data(self):
+        return " ".join(self._chunks)
