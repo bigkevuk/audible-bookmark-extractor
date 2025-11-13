@@ -37,7 +37,7 @@ Currently, the tool supports exporting to Excel and [Readwise](https://readwise.
 - You can still run ad-hoc lookups with `search_pdf --query="some text"` (optional `--threshold` and `--max_results`) to print the top fuzzy matches.
 - Documents are cached after the first scan, so repeated searches stay fast until the source files change.
 - When you download a book, we now capture Audible's `chapter_info` payload (start/end offsets per chapter) and cache it to `<book_root>/chapter_timestamps.json` for later alignment with EPUB/PDF matches or any downstream tooling.
-- During `get_bookmarks`, each exported clip filename is suffixed with its chapter title (using `chapter_timestamps.json`) so you can spot the surrounding context at a glance.
+- During `get_bookmarks`, each exported clip filename is suffixed with its chapter title (using `chapter_timestamps.json`) so you can spot the surrounding context at a glance, and `transcribe_bookmarks` copies that chapter metadata into each `extracted text/*.json` clip file for downstream search.
 
 ## Authentication
 

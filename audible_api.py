@@ -663,6 +663,12 @@ class AudibleAPI:
                         "startPosition": bookmark_meta.get("startPosition"),
                         "endPosition": bookmark_meta.get("endPosition")
                     }
+                    chapter_title = bookmark_meta.get("chapterTitle")
+                    if chapter_title:
+                        clip_payload["chapterTitle"] = chapter_title
+                    chapter_index = bookmark_meta.get("chapterIndex")
+                    if chapter_index is not None:
+                        clip_payload["chapterIndex"] = chapter_index
                     with open(extracted_text_file_path, "w", encoding="utf-8") as text_file:
                         json.dump(clip_payload, text_file, ensure_ascii=False, indent=2)
             transcription_contents_path = os.path.join(transcribed_clips_dir_path, "contents.json")
