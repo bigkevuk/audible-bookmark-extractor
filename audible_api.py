@@ -3,16 +3,35 @@ import json
 import sys
 import asyncio
 import requests
+import shutil
+import re
+import hashlib
+from difflib import SequenceMatcher
 from getpass import getpass
 
-import pandas as pd
-import pandas.io.formats.excel
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+try:
+    import whisper
+except ImportError:
+    whisper = None
+try:
+    import torch
+except ImportError:
+    torch = None
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:
+    snapshot_download = None
 import audible
 
 from pydub import AudioSegment
 
 import speech_recognition as sr
 from openai import OpenAI
+from PyPDF2 import PdfReader
 
 from errors import ExternalError
 from constants import artifacts_root_directory
@@ -45,6 +64,9 @@ class AudibleAPI:
         self.auth = auth
         self.books = []
         self.library = {}
+        self._pdf_cache = {}
+        self._library_cache_path = os.path.join(os.path.dirname(__file__), "library_cache.json")
+        self._load_library_cache()
 
     @classmethod
     async def authenticate(self) -> "AudibleAPI":
@@ -94,13 +116,12 @@ class AudibleAPI:
     # Helper function for displaying the users books and allowing them to select one based on the index number
     async def get_book_selection(self):
 
-        if not self.library:
+        if not self.library.get("items"):
             await self.get_library()
 
-        li_books = []
-        # if not self.lib
-        for index, book in enumerate(self.library["items"]):
-            li_books.append(book["asin"])
+        items = self.library.get("items", [])
+        li_books = [{"title": book, "asin": book.get("asin")} for book in items]
+        for index, book in enumerate(items):
             book_title = book.get("title", "Unable to retrieve book name")
             print(f"{index}: {book_title}")
 
@@ -108,16 +129,16 @@ class AudibleAPI:
             "Enter the index number of the book you would like to download, or enter --all for all available books: \n")
 
         if book_selection == "--all":
-            li_books = [{"title": book.get("title", 'untitled'), "asin": book["asin"]}
-                        for book in self.library["items"]]
+            return [{"title": book.get("title", 'untitled'), "asin": book.get("asin")}
+                    for book in items]
 
         else:
             try:
-                li_books = [{"title": self.library["items"][int(book_selection)],
-                             "asin":self.library["items"][int(book_selection)].get("asin", None)}]
+                selected = li_books[int(book_selection)]
+                return [selected]
             except (IndexError, ValueError):
                 print("Invalid selection")                
-        return li_books
+        return []
 
     # Main download books function
     async def cmd_download_books(self):
@@ -214,7 +235,10 @@ class AudibleAPI:
         await self.cmd_show_library()
         
     # Gets all books and info for account and adds it to self.books, also returns ASIN for all books
-    async def get_library(self):
+    async def get_library(self, force_refresh=False):
+        if self.library and self.books and not force_refresh:
+            return [book.get("asin") for book in self.library.get("items", []) if book.get("asin")]
+
         async with audible.AsyncClient(self.auth) as client:
             self.library = await client.get(
                 path="library",
@@ -222,13 +246,16 @@ class AudibleAPI:
                     "num_results": 999
                 }
             )
-            asins = [book["asin"] for book in self.library["items"]]
-
-            for book in self.library["items"]:
-                asins.append(book["asin"])
+            self.books = []
+            items = self.library.get("items", [])
+            asins = []
+            for book in items:
+                asin = book.get("asin")
+                if asin:
+                    asins.append(asin)
                 book_title = book.get("title", "Unable to retrieve book name")
                 self.books.append(book_title)
-
+            self._save_library_cache()
             return asins
 
     async def cmd_show_library(self):
@@ -237,6 +264,11 @@ class AudibleAPI:
 
         for index, book_title in enumerate(self.books):
             print(f"{index}: {book_title}")
+    
+    async def cmd_refresh_library(self):
+        print("Refreshing library cache from Audible...")
+        await self.get_library(force_refresh=True)
+        print(f"Cached {len(self.books)} books locally.")
    
 
     async def cmd_get_bookmarks(self):
@@ -253,65 +285,91 @@ class AudibleAPI:
 
         title = _title.lower().replace(" ", "_")
 
-        bookmarks_url = f"https://cde-ta-g7g.amazon.com/FionaCDEServiceEngine/sidecar?type=AUDI&key={asin}"
-        print(f"Getting bookmarks for {_title}")
-        with audible.Client(auth=self.auth, response_callback=self.bookmark_response_callback) as client:
-            library = client.get(
-                bookmarks_url,
-                num_results=1000,
-                response_groups="product_desc, product_attrs"
-            )
+        bookmarks_dir = os.path.join(artifacts_root_directory, "audiobooks", title, "bookmarks")
+        os.makedirs(bookmarks_dir, exist_ok=True)
+        bookmarks_path = os.path.join(bookmarks_dir, "bookmarks.json")
 
-            li_bookmarks = library.json().get("payload", {}).get("records", [])
-            li_clips = sorted(
-                li_bookmarks, key=lambda i: i["type"], reverse=True)
+        li_bookmarks = self._load_bookmarks_from_disk(bookmarks_path)
+        if li_bookmarks is None:
+            bookmarks_url = f"https://cde-ta-g7g.amazon.com/FionaCDEServiceEngine/sidecar?type=AUDI&key={asin}"
+            print(f"Fetching bookmarks from Audible for {_title}")
+            try:
+                with audible.Client(auth=self.auth, response_callback=self.bookmark_response_callback) as client:
+                    library = client.get(
+                        bookmarks_url,
+                        num_results=1000,
+                        response_groups="product_desc, product_attrs"
+                    )
+                    li_bookmarks = library.json().get("payload", {}).get("records", [])
+            except Exception as exc:
+                print(f"Failed to retrieve bookmarks from Audible: {exc}")
+                return
 
-            title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
-            title_aax_path = os.path.join(title_dir_path, f"{title}.aax")
-            title_m4b_path = os.path.join(title_dir_path, f"{title}.m4b")
-            title_mp3_path = os.path.join(title_dir_path, f"{title}.mp3")
+            self._save_bookmarks_to_disk(bookmarks_path, li_bookmarks)
+        else:
+            print(f"Loaded cached bookmarks from {bookmarks_path}")
 
-            # Load audiobook into AudioSegment so we can slice it
-            audio_book = AudioSegment.from_mp3(
-                title_mp3_path)
+        sorted_records = sorted(li_bookmarks, key=lambda i: i.get("type", ""), reverse=True)
 
-            file_counter = 1
-            notes_dict = {}
+        combined_clips = self._combine_overlapping_bookmarks(li_bookmarks)
+        total_clip_entries = len(combined_clips)
+        if not total_clip_entries:
+            print("No clips found in the bookmark payload.")
+            return
+        print(f"Preparing {total_clip_entries} clips for {_title}...")
 
-            # Check whether a folder in clips/ for the book exists or not
-            clips_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title, "clips")
-            path_exists = os.path.exists(clips_dir_path)
-            if not path_exists:
-                os.makedirs(clips_dir_path)
+        title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
+        title_aax_path = os.path.join(title_dir_path, f"{title}.aax")
+        title_m4b_path = os.path.join(title_dir_path, f"{title}.m4b")
+        title_mp3_path = os.path.join(title_dir_path, f"{title}.mp3")
 
-            for audio_clip in li_clips:
-                # Get start position to slice
-                raw_start_pos = int(audio_clip["startPosition"])
+        # Load audiobook into AudioSegment so we can slice it
+        audio_book = AudioSegment.from_mp3(title_mp3_path)
 
-                # If we have a note then we save it so we can use it as the title for the bookmark text
-                if audio_clip.get("type", None) in ["audible.note"]:
-                    notes_dict[raw_start_pos] = audio_clip.get("text")
-                    print(
-                        f"CLIP: {notes_dict[raw_start_pos]}  {raw_start_pos}")
+        file_counter = 1
+        processed_clips = 0
+        notes_dict = {}
 
-                if audio_clip.get("type", None) in ["audible.clip", "audible.bookmark"]:
-                    start_pos = raw_start_pos - START_POSITION_OFFSET
-                    end_pos = int(audio_clip.get(
-                        "endPosition", raw_start_pos + 30000)) + END_POSITION_OFFSET
-                    if start_pos == end_pos:
-                        end_pos += 30000
+        # Check whether a folder in clips/ for the book exists or not
+        clips_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title, "clips")
+        path_exists = os.path.exists(clips_dir_path)
+        if not path_exists:
+            os.makedirs(clips_dir_path)
 
-                    # Slice it up
-                    clip = audio_book[start_pos:end_pos]
+        for audio_clip in sorted_records:
+            # Get start position to slice
+            raw_start_raw = audio_clip.get("startPosition")
+            if raw_start_raw is None:
+                continue
+            raw_start_pos = int(raw_start_raw)
 
-                    file_name = notes_dict.get(
-                        raw_start_pos, f"clip{file_counter}")
+            # If we have a note then we save it so we can use it as the title for the bookmark text
+            if audio_clip.get("type", None) in ["audible.note"]:
+                notes_dict[raw_start_pos] = audio_clip.get("text")
+                print(
+                    f"CLIP: {notes_dict[raw_start_pos]}  {raw_start_pos}")
 
-                    # Save the clip
-                    clip_path = os.path.join(clips_dir_path, f"{file_name}.flac")
-                    clip.export(
-                        clip_path, format="flac")
-                    file_counter += 1
+        for clip_entry in combined_clips:
+            raw_start_pos = clip_entry.get("startPosition")
+            if raw_start_pos is None:
+                continue
+            start_pos = raw_start_pos - START_POSITION_OFFSET
+            end_pos = int(clip_entry.get("endPosition", raw_start_pos + 30000)) + END_POSITION_OFFSET
+            if start_pos == end_pos:
+                end_pos += 30000
+
+            # Slice it up
+            clip = audio_book[start_pos:end_pos]
+
+            note_name = self._resolve_clip_note(notes_dict, clip_entry)
+            file_name = note_name if note_name else f"clip{file_counter:04d}"
+
+            # Save the clip
+            clip_path = os.path.join(clips_dir_path, f"{file_name}.flac")
+            processed_clips += 1
+            print(f"[{processed_clips}/{total_clip_entries}] Exporting {file_name}.flac")
+            clip.export(clip_path, format="flac")
+            file_counter += 1
 
     async def cmd_convert_audiobook(self):
         # FFMPEG needs to be installed for this step! see readme for more details
@@ -338,12 +396,89 @@ class AudibleAPI:
             os.system(
                 f"ffmpeg -i {title_m4b_path} {title_mp3_path}")
 
-    async def cmd_transcribe_bookmarks(self, openai_api_key=None):
+    async def cmd_transcribe_bookmarks(self, openai_api_key=None, whisper_mode=None, whisper_model=None, whisper_device=None):
         li_books = await self.get_book_selection()
 
-        # Initialize OpenAI client if API key is provided, otherwise fall back to Google
-        use_openai = openai_api_key is not None
-        if use_openai:
+        global pd
+        if pd is None:
+            try:
+                import pandas as _pd
+            except ImportError:
+                print("Transcription export requires pandas. Install it with 'pip install pandas'.")
+                return
+            pd = _pd
+
+        from pandas.io.formats.excel import ExcelFormatter
+        ExcelFormatter.header_style = None
+
+        # Determine transcription mode
+        transcription_mode = (whisper_mode or ("openai" if openai_api_key else "google")).lower()
+        if transcription_mode == "openai" and openai_api_key is None:
+            print("OpenAI Whisper mode requested but no API key is configured; falling back to Google Speech Recognition.")
+            transcription_mode = "google"
+        use_openai = transcription_mode == "openai"
+        use_local_whisper = transcription_mode == "local"
+
+        local_whisper_model = None
+        local_whisper_transcribe_kwargs = {}
+        if use_local_whisper:
+            if whisper is None:
+                print("Local Whisper requested but the 'whisper' package is not installed. Install it via 'pip install git+https://github.com/openai/whisper.git' (requires PyTorch).")
+                return
+            if snapshot_download is None:
+                print("Local Whisper requested but 'huggingface-hub' is not installed. Install it with 'pip install huggingface-hub'.")
+                return
+            model_name = whisper_model or "base"
+            if whisper_device:
+                requested_device = whisper_device
+            else:
+                requested_device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+            if requested_device.startswith("cuda") and (not torch or not torch.cuda.is_available()):
+                print("CUDA requested but not available; falling back to CPU for local Whisper.")
+                requested_device = "cpu"
+            if requested_device == "cpu" or requested_device.startswith("mps"):
+                local_whisper_transcribe_kwargs["fp16"] = False
+                print(f"Running local Whisper on {requested_device.upper()} with fp16 disabled.")
+            model_repo_id = f"openai/whisper-{model_name}"
+            whisper_model_root = os.path.join(artifacts_root_directory, "models", "whisper")
+            local_model_dir = os.path.join(whisper_model_root, model_name)
+            os.makedirs(local_model_dir, exist_ok=True)
+            target_model_path = os.path.join(whisper_model_root, f"{model_name}.pt")
+
+            if not os.path.exists(target_model_path):
+                print(f"Ensuring Whisper model '{model_name}' is available locally via Hugging Face...")
+                try:
+                    snapshot_path = snapshot_download(
+                        repo_id=model_repo_id,
+                        cache_dir=local_model_dir,
+                        local_dir=local_model_dir,
+                        allow_patterns=["*.bin", "*.json", "*.txt", "*.model", "*.pt", "*.tiktoken"]
+                    )
+                except Exception as exc:
+                    print(f"Failed to download Whisper model '{model_name}' from Hugging Face: {exc}")
+                    return
+
+                source_model_path = self._locate_whisper_weights(snapshot_path, model_name)
+                if not source_model_path:
+                    print(f"Unable to locate model weights inside the downloaded snapshot for '{model_name}'.")
+                    return
+
+                try:
+                    shutil.copy2(source_model_path, target_model_path)
+                except OSError as exc:
+                    print(f"Failed to copy Whisper weights to {target_model_path}: {exc}")
+                    return
+
+            self._patch_whisper_sha(model_name, target_model_path)
+
+            try:
+                print("Loading Whisper model (download cached locally)...")
+                local_whisper_model = whisper.load_model(model_name, download_root=whisper_model_root, device=requested_device)
+            except Exception as exc:
+                print(f"Failed to load Whisper model '{model_name}': {exc}")
+                return
+            print(f"Using local Whisper model '{model_name}' for transcription")
+        elif use_openai:
             client = OpenAI(api_key=openai_api_key)
             print("Using OpenAI Whisper API for transcription")
         else:
@@ -362,34 +497,60 @@ class AudibleAPI:
             title = _title.lower().replace(" ", "_")
             title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
             clips_dir_path = os.path.join(title_dir_path, "clips")
-            directory = os.fsencode(clips_dir_path)
-
-            path_exists = os.path.exists(directory)
+            path_exists = os.path.exists(clips_dir_path)
             if not path_exists:
-                os.makedirs(directory)
+                os.makedirs(clips_dir_path)
 
             transcribed_clips_dir_path = os.path.join(title_dir_path, "trancribed_clips")
             trancribed_clips_path_exists = os.path.exists(transcribed_clips_dir_path)
             if not trancribed_clips_path_exists:
                 os.makedirs(transcribed_clips_dir_path)
 
-            for file in os.listdir(directory):
+            processed_dir_path = os.path.join(title_dir_path, "proccesedd")
+            if not os.path.exists(processed_dir_path):
+                os.makedirs(processed_dir_path)
+
+            extracted_text_dir_path = os.path.join(title_dir_path, "extracted text")
+            if not os.path.exists(extracted_text_dir_path):
+                os.makedirs(extracted_text_dir_path)
+
+            clip_files = sorted(
+                [file for file in os.listdir(clips_dir_path) if file.endswith(".flac")]
+            )
+
+            total_clips = len(clip_files)
+            if not total_clips:
+                print(f"No clips found to transcribe for '{_title}'. Skipping.")
+                continue
+
+            print(f"Found {total_clips} clips for '{_title}'. Starting transcription...")
+
+            for idx, file in enumerate(clip_files, start=1):
                 highlight = {}
-                filename = os.fsdecode(file)
+                filename = file
+                print(f"[{idx}/{total_clips}] Preparing {filename}")
                 highlight["title"] = _title
                 highlight["author"] = allAuthors
                 if not filename.startswith("clip"):
                     highlight["note"] = filename.replace(".flac", "")
                 highlight["source_type"] = "audible_bookmark_extractor"
                 if filename.endswith(".flac"):
-                    print(os.path.join(os.fsdecode(directory), filename))
+                    clip_full_path = os.path.join(clips_dir_path, filename)
+                    print(f"Processing file: {clip_full_path}")
                     heading = filename.replace(".flac", "")
+                    text = ""
 
                     try:
-                        if use_openai:
+                        if use_local_whisper and local_whisper_model:
+                            print(f"  -> Transcribing {filename} using local Whisper...")
+                            result = local_whisper_model.transcribe(
+                                clip_full_path,
+                                **local_whisper_transcribe_kwargs
+                            )
+                            text = (result.get("text") or "").strip()
+                        elif use_openai:
                             # Use OpenAI Whisper API
-                            audio_file_path = os.path.join(os.fsdecode(directory), filename)
-                            with open(audio_file_path, "rb") as audio_file:
+                            with open(clip_full_path, "rb") as audio_file:
                                 transcription = client.audio.transcriptions.create(
                                     model="gpt-4o-transcribe",
                                     file=audio_file
@@ -397,23 +558,21 @@ class AudibleAPI:
                                 text = transcription.text
                         else:
                             # Use Google Speech Recognition
-                            audioclip = sr.AudioFile(os.path.join(
-                                os.fsdecode(directory), filename))
+                            audioclip = sr.AudioFile(clip_full_path)
                             with audioclip as source:
                                 audio = r.record(source)
                             text = r.recognize_google(audio)
-                        
+
                         pairs[str(heading)] = text
                         highlight["text"] = text
                     except Exception as e:
                         highlight["text"] = ""
+                        text = ""
                         print(f"Error while recognizing this clip {heading}: {e}")
                     
                     xcel = pd.DataFrame(pairs.values(), index=pairs.keys())
 
                     # Change header format so that rows can be edited
-                    pandas.io.formats.excel.ExcelFormatter.header_style = None
-
                     if highlight["text"]:
                         jsonHighlights.append(highlight)
                     
@@ -454,9 +613,63 @@ class AudibleAPI:
 
                     # Apply changes and save xlsx to Transcribed bookmarks folder.
                     writer.close()
+
+                    processed_file_path = os.path.join(processed_dir_path, filename)
+                    if os.path.exists(processed_file_path):
+                        os.remove(processed_file_path)
+                    shutil.move(clip_full_path, processed_file_path)
+
+                    extracted_text_file_path = os.path.join(extracted_text_dir_path, f"{heading}.txt")
+                    with open(extracted_text_file_path, "w", encoding="utf-8") as text_file:
+                        text_file.write(text)
             transcription_contents_path = os.path.join(transcribed_clips_dir_path, "contents.json")
             with open(transcription_contents_path, "w") as f:
-                json.dump(jsonHighlights, f, indent=4)                
+                json.dump(jsonHighlights, f, indent=4)
+    
+    async def cmd_search_pdf(self, query=None, threshold=None, max_results=None):
+        clip_mode = query is None or not str(query).strip()
+        query_value = str(query).strip() if query else ""
+
+        try:
+            threshold_value = float(threshold) if threshold is not None else 0.1
+        except ValueError:
+            print("Invalid threshold supplied; expected a number between 0 and 1.")
+            return
+
+        try:
+            max_results_value = int(max_results) if max_results is not None else 5
+        except ValueError:
+            print("Invalid max_results supplied; expected an integer.")
+            return
+
+        li_books = await self.get_book_selection()
+        for book in li_books:
+            raw_title = book.get("title", {}).get("title") or book.get("title", "untitled")
+            normalized_title = raw_title.strip() if isinstance(raw_title, str) else "untitled"
+            title_slug = normalized_title.lower().replace(" ", "_")
+            title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title_slug)
+            pdf_path = self._resolve_pdf_path(normalized_title, title_dir_path)
+
+            if not pdf_path:
+                print(f"No PDF found for '{normalized_title}'. Expected it under {title_dir_path}/pdf or the global pdf directory.")
+                continue
+
+            if clip_mode:
+                print(f"\nMapping clip transcriptions for '{normalized_title}' using {pdf_path}...")
+                self._map_clips_to_pdf(title_dir_path, pdf_path, threshold_value)
+            else:
+                print(f"\nSearching '{normalized_title}' ({pdf_path}) for '{query_value}'...")
+                matches = self.fuzzy_search_pdf(pdf_path, query_value, threshold_value, max_results_value)
+
+                if not matches:
+                    print(f"No matches found for '{query_value}' in '{normalized_title}'.")
+                    continue
+
+                for idx, match in enumerate(matches, start=1):
+                    snippet = match["snippet"]
+                    score = match["score"]
+                    page = match["page"]
+                    print(f"{idx}. [page {page}, score {score:.2f}] {snippet}")
 
     def get_activation_bytes(self):
 
@@ -478,3 +691,327 @@ class AudibleAPI:
 
     def bookmark_response_callback(self, resp):
         return resp
+
+    def _load_bookmarks_from_disk(self, bookmarks_path):
+        if not os.path.exists(bookmarks_path):
+            return None
+        try:
+            with open(bookmarks_path, "r", encoding="utf-8") as bookmarks_file:
+                return json.load(bookmarks_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Failed to load cached bookmarks ({exc}), refetching...")
+            return None
+
+    def _save_bookmarks_to_disk(self, bookmarks_path, li_bookmarks):
+        try:
+            with open(bookmarks_path, "w", encoding="utf-8") as bookmarks_file:
+                json.dump(li_bookmarks, bookmarks_file, indent=2, ensure_ascii=False)
+            print(f"Saved bookmark metadata to {bookmarks_path}")
+        except OSError as exc:
+            print(f"Failed to write bookmark metadata: {exc}")
+
+    def fuzzy_search_pdf(self, pdf_path, query, threshold=0.6, max_results=5):
+        query_clean = query.strip()
+        if not query_clean:
+            return []
+
+        matches = []
+        pages_text = self._get_cached_pdf_pages(pdf_path)
+        if pages_text is None:
+            return matches
+
+        for page_number, page_text in enumerate(pages_text, start=1):
+            for snippet in self._split_text_snippets(page_text):
+                ratio = SequenceMatcher(None, query_clean.lower(), snippet.lower()).ratio()
+                if ratio >= threshold:
+                    matches.append({
+                        "page": page_number,
+                        "score": ratio,
+                        "snippet": snippet
+                    })
+
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches[:max_results]
+
+    def _map_clips_to_pdf(self, title_dir_path, pdf_path, threshold):
+        extracted_text_dir_path = os.path.join(title_dir_path, "extracted text")
+        if not os.path.isdir(extracted_text_dir_path):
+            print(f"No extracted text directory found for this book at {extracted_text_dir_path}.")
+            return
+
+        clip_texts = self._collect_clip_texts(extracted_text_dir_path)
+        if not clip_texts:
+            print(f"No clip transcription files were found in {extracted_text_dir_path}.")
+            return
+
+        pages_text = self._get_cached_pdf_pages(pdf_path)
+        if pages_text is None:
+            return
+
+        references = []
+        total_clips = len(clip_texts)
+        output_path = os.path.join(extracted_text_dir_path, "clip_pdf_references.json")
+
+        for index, (clip_name, clip_text) in enumerate(clip_texts, start=1):
+            print(f"Processing clip {index}/{total_clips}: {clip_name}")
+            if not clip_text.strip():
+                references.append({
+                    "clip": clip_name,
+                    "matched": False,
+                    "reason": "Transcription is empty."
+                })
+            else:
+                match = self._best_pdf_match(pages_text, clip_text, threshold)
+                if match:
+                    references.append({
+                        "clip": clip_name,
+                        "matched": True,
+                        "pdf_page": match["page"],
+                        "score": round(match["score"], 3),
+                        "snippet": match["snippet"]
+                    })
+                else:
+                    references.append({
+                        "clip": clip_name,
+                        "matched": False,
+                        "reason": f"No PDF location exceeded similarity threshold {threshold}."
+                    })
+
+            self._write_clip_reference_summary(output_path, references)
+
+        print(f"Wrote clip reference summary to {output_path}")
+
+    def _write_clip_reference_summary(self, output_path, references):
+        try:
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                json.dump(references, output_file, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            print(f"Failed to write clip reference summary: {exc}")
+
+    def _combine_overlapping_bookmarks(self, li_bookmarks):
+        clip_types = {"audible.clip", "audible.bookmark"}
+        clip_entries = []
+        for record in li_bookmarks:
+            if record.get("type") in clip_types:
+                start_raw = record.get("startPosition")
+                end_raw = record.get("endPosition")
+                if start_raw is None or end_raw is None:
+                    continue
+                copy_record = record.copy()
+                start = int(start_raw)
+                end = int(end_raw)
+                copy_record["startPosition"] = start
+                copy_record["endPosition"] = end
+                copy_record["_note_positions"] = [start]
+                clip_entries.append(copy_record)
+
+        clip_entries.sort(key=lambda rec: rec["startPosition"])
+        merged = []
+        for clip in clip_entries:
+            if not merged:
+                merged.append(clip)
+                continue
+            last = merged[-1]
+            if clip["startPosition"] <= last["endPosition"]:
+                last["endPosition"] = max(last["endPosition"], clip["endPosition"])
+                last["_note_positions"].extend(clip["_note_positions"])
+            else:
+                merged.append(clip)
+        for clip in merged:
+            clip["clip_length_seconds"] = max(clip["endPosition"] - clip["startPosition"], 0) / 1000.0
+        return merged
+
+    def _resolve_clip_note(self, notes_dict, clip_entry):
+        for pos in clip_entry.get("_note_positions", []):
+            if pos in notes_dict:
+                return notes_dict[pos]
+        start_pos = clip_entry.get("startPosition")
+        if start_pos in notes_dict:
+            return notes_dict[start_pos]
+        return None
+
+    def _collect_clip_texts(self, extracted_text_dir_path):
+        clip_texts = []
+        try:
+            files = sorted(os.listdir(extracted_text_dir_path))
+        except OSError as exc:
+            print(f"Unable to read extracted text directory {extracted_text_dir_path}: {exc}")
+            return clip_texts
+
+        for file_name in files:
+            if not file_name.lower().endswith(".txt"):
+                continue
+            file_path = os.path.join(extracted_text_dir_path, file_name)
+            try:
+                with open(file_path, "r", encoding="utf-8") as clip_file:
+                    text = clip_file.read()
+            except OSError as exc:
+                print(f"Failed to read {file_path}: {exc}")
+                continue
+
+            clip_name = os.path.splitext(file_name)[0]
+            clip_texts.append((clip_name, text))
+
+        return clip_texts
+
+    def _best_pdf_match(self, pages_text, query, threshold):
+        query_clean = query.strip()
+        if not query_clean:
+            return None
+
+        best_match = None
+        lc_query = query_clean.lower()
+
+        for page_number, page_text in enumerate(pages_text, start=1):
+            for snippet in self._split_text_snippets(page_text):
+                ratio = SequenceMatcher(None, lc_query, snippet.lower()).ratio()
+                if ratio >= threshold and (best_match is None or ratio > best_match["score"]):
+                    best_match = {
+                        "page": page_number,
+                        "score": ratio,
+                        "snippet": snippet
+                    }
+
+        return best_match
+
+    def _split_text_snippets(self, text):
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+
+        snippets = re.split(r'(?<=[.!?])\s+', normalized)
+        snippets = [snippet.strip() for snippet in snippets if snippet.strip()]
+        if not snippets:
+            return [normalized]
+        return snippets
+
+    def _resolve_pdf_path(self, book_title, title_dir_path=None):
+        normalized_key = self._normalized_key(book_title)
+
+        search_directories = []
+        if title_dir_path:
+            search_directories.append(os.path.join(title_dir_path, "pdf"))
+
+        pdf_root = os.path.join(artifacts_root_directory, "pdf")
+        search_directories.append(pdf_root)
+
+        for folder in search_directories:
+            if not os.path.isdir(folder):
+                continue
+            for file_name in os.listdir(folder):
+                if not file_name.lower().endswith(".pdf"):
+                    continue
+                key = self._normalized_key(os.path.splitext(file_name)[0])
+                if key == normalized_key:
+                    return os.path.join(folder, file_name)
+
+        return None
+
+    def _normalized_key(self, value):
+        if not isinstance(value, str):
+            value = str(value)
+        return re.sub(r"[^a-z0-9]", "", value.lower())
+
+    def _load_library_cache(self):
+        if not os.path.exists(self._library_cache_path):
+            return
+        try:
+            with open(self._library_cache_path, "r", encoding="utf-8") as cache_file:
+                data = json.load(cache_file)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        self.library = data.get("library", {})
+        self.books = data.get("books", [])
+
+    def _save_library_cache(self):
+        payload = {
+            "library": self.library,
+            "books": self.books
+        }
+        try:
+            with open(self._library_cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(payload, cache_file, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            print(f"Unable to write library cache: {exc}")
+
+    def _get_cached_pdf_pages(self, pdf_path):
+        abs_path = os.path.abspath(pdf_path)
+        try:
+            last_modified = os.path.getmtime(abs_path)
+        except OSError as exc:
+            print(f"Unable to access PDF at {pdf_path}: {exc}")
+            return None
+
+        cache_entry = self._pdf_cache.get(abs_path)
+        if cache_entry and cache_entry.get("last_modified") == last_modified:
+            return cache_entry.get("pages")
+
+        pages = self._extract_pdf_pages(abs_path)
+        if pages is None:
+            return None
+
+        self._pdf_cache[abs_path] = {
+            "pages": pages,
+            "last_modified": last_modified
+        }
+        return pages
+
+    def _locate_whisper_weights(self, snapshot_root, model_name):
+        preferred_names = [
+            f"{model_name}.pt",
+            f"{model_name}.bin",
+            "model.bin",
+            "pytorch_model.bin",
+        ]
+
+        for root, _dirs, files in os.walk(snapshot_root):
+            for name in preferred_names:
+                if name in files:
+                    return os.path.join(root, name)
+
+        fallback_extensions = (".bin", ".pt", ".model")
+        for root, _dirs, files in os.walk(snapshot_root):
+            for file_name in files:
+                if file_name.endswith(fallback_extensions):
+                    return os.path.join(root, file_name)
+
+        return None
+
+    def _patch_whisper_sha(self, model_name, model_path):
+        if not whisper or not os.path.exists(model_path):
+            return
+        try:
+            from whisper import _download  # type: ignore
+            models = getattr(_download, "_MODELS", None)
+            if not isinstance(models, dict):
+                return
+            models.setdefault(model_name, {})
+            models[model_name]["sha256"] = self._compute_file_sha(model_path)
+        except Exception:
+            return
+
+    def _compute_file_sha(self, file_path):
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    def _extract_pdf_pages(self, pdf_path):
+        pages = []
+        try:
+            reader = PdfReader(pdf_path)
+        except Exception as exc:
+            print(f"Unable to read PDF at {pdf_path}: {exc}")
+            return None
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception as exc:
+                print(f"Failed to extract text from page {page_number}: {exc}")
+                page_text = ""
+            pages.append(page_text)
+
+        return pages

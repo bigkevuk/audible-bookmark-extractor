@@ -28,6 +28,14 @@ Currently, the tool supports exporting to Excel and [Readwise](https://readwise.
    ```
 
 3. Type `help` in the command line for a list of available commands.
+- Run `refresh_library` anytime to pull a fresh Audible library snapshot; `list_books` reuses the cached list for quicker lookups.
+
+## PDF Search
+
+- Store companion PDFs within each audiobook directory (e.g., `~/audible-bookmark-extractor/audiobooks/<book_title>/pdf/book.pdf`). A global `~/audible-bookmark-extractor/pdf` fallback is still supported.
+- After transcribing, run `search_pdf` to list your books, choose one, and automatically map every clip transcription (`extracted text/*.txt`) to the most likely PDF page. Results are saved to `extracted text/clip_pdf_references.json`.
+- You can still run ad-hoc lookups with `search_pdf --query="some text"` (optional `--threshold` and `--max_results`) to print the top fuzzy matches.
+- PDFs are cached after the first scan, so repeated searches stay fast until the PDF changes.
 
 ## Authentication
 
@@ -70,7 +78,8 @@ Once posted, you can visit [Readwise Books](https://readwise.io/books) to see th
 
 ## Transcription
 
-- OpenAI Whisper (optional): Provide an API key via `openai_authenticate` to use Whisper-based transcription.
+- OpenAI Whisper (cloud): Provide an API key via `openai_authenticate`, then run `transcribe_bookmarks` (default). To force it, use `transcribe_bookmarks --whisper_mode=openai`.
+- OpenAI Whisper (local): Install Whisper manually (e.g. `pip install git+https://github.com/openai/whisper.git` plus PyTorch per their docs) and `pip install huggingface-hub`. When you run `transcribe_bookmarks --whisper_mode=local --whisper_model=base --whisper_device=cuda`, the app downloads the entire `openai/whisper-<model>` snapshot from Hugging Face (model.bin plus tokenizer files), copies the weights to `<model>.pt` in `~/audible-bookmark-extractor/models/whisper`, and loads them locally so audio never leaves your machine.
 - Google Speech Recognition (default fallback): If no OpenAI key is provided, the app uses the SpeechRecognition library’s Google recognizer; no API key required.
 
 ## FFMPEG Setup

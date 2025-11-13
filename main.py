@@ -1,5 +1,13 @@
 import asyncio
-from command import Command
+import sys
+
+try:
+    from command import Command
+except ModuleNotFoundError as exc:
+    if exc.name == "audible":
+        print("The 'audible' package is not installed. Please run 'pip install -r requirements.txt' before starting the app.")
+        sys.exit(1)
+    raise
 
 async def main():
     cmd = Command()

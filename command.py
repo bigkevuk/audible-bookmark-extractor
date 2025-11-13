@@ -14,7 +14,9 @@ help_dict = {
     "download_books": "Downloads books and saves them locally",
     "convert_audiobook": "Removes Audible DRM from the selected audiobooks and converts them to .mp3 so they can be sliced",
     "get_bookmarks": "WIP, extracts all timestamps for bookmarks in the selected audiobook",
-    "transcribe_bookmarks": "Transcribes bookmarks; uses OpenAI Whisper if configured, otherwise Google Speech Recognition (no API key required)",
+    "transcribe_bookmarks": "Transcribes bookmarks (OpenAI Whisper, local Whisper, or Google Speech Recognition)",
+    "search_pdf": "Fuzzy-search the stored PDF of a selected book for a given query",
+    "refresh_library": "Refreshes the cached Audible library metadata",
     "quit/exit": "Exits this application"
 }
 

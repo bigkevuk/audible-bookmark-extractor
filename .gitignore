@@ -5,6 +5,7 @@ sensitive/
 env/
 credentials.json
 activation_bytes.txt
+library_cache.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
