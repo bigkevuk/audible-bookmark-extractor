@@ -7,6 +7,7 @@ import shutil
 import re
 import hashlib
 import zipfile
+from datetime import datetime
 from html.parser import HTMLParser
 from difflib import SequenceMatcher
 from getpass import getpass
@@ -103,12 +104,12 @@ class AudibleAPI:
                     path=f"library/{asin}",
                     params={
                         "response_groups": (
-                            "contributors, media, price, reviews, product_attrs, "
-                            "product_extended_attrs, product_desc, product_plan_details, "
-                            "product_plans, rating, sample, sku, series, ws4v, origin, "
-                            "relationships, review_attrs, categories, badge_types, "
-                            "category_ladders, claim_code_url, is_downloaded, pdf_url, "
-                            "is_returnable, origin_asin, percent_complete, provided_review"
+                        "contributors, media, price, reviews, product_attrs, "
+                        "product_extended_attrs, product_desc, product_plan_details, "
+                        "product_plans, rating, sample, sku, series, ws4v, origin, "
+                        "relationships, review_attrs, categories, badge_types, "
+                        "category_ladders, claim_code_url, is_downloaded, pdf_url, "
+                        "is_returnable, origin_asin, percent_complete, provided_review"
                         )
                     }
                 )
@@ -184,10 +185,13 @@ class AudibleAPI:
                 audible_response = requests.get(re, stream=True)
 
                 title_dir_path = os.path.join(artifacts_root_directory, "audiobooks", title)
-                path_exists = os.path.exists(title_dir_path)
-                if not path_exists:
-                    os.makedirs(title_dir_path)
-                    
+                os.makedirs(title_dir_path, exist_ok=True)
+
+                chapter_info_payload = (book.get("item") or {}).get("chapter_info") if hasattr(book, "get") else None
+                if not chapter_info_payload:
+                    chapter_info_payload = self._fetch_chapter_info(asin)
+
+                self._persist_chapter_timestamps(book, title_dir_path, explicit_chapter_info=chapter_info_payload)
 
                 if audible_response.ok:
                     title_file_path = os.path.join(title_dir_path, f"{title}.aax")
@@ -336,6 +340,7 @@ class AudibleAPI:
 
         # Load audiobook into AudioSegment so we can slice it
         audio_book = AudioSegment.from_mp3(title_mp3_path)
+        chapter_timestamps = self._load_chapter_timestamps(title_dir_path)
 
         file_counter = 1
         processed_clips = 0
@@ -374,7 +379,11 @@ class AudibleAPI:
             clip = audio_book[start_pos:end_pos]
 
             note_name = self._resolve_clip_note(notes_dict, clip_entry)
-            file_name = note_name if note_name else f"clip{file_counter:04d}"
+            chapter_match = self._resolve_chapter_for_timestamp(chapter_timestamps, raw_start_pos)
+            chapter_title = chapter_match.get("title") if chapter_match else None
+
+            base_name = note_name if note_name else f"clip{file_counter:04d}"
+            file_name = self._format_clip_filename(base_name, chapter_title)
 
             # Save the clip
             clip_path = os.path.join(clips_dir_path, f"{file_name}.flac")
@@ -383,12 +392,16 @@ class AudibleAPI:
             clip.export(clip_path, format="flac")
             file_counter += 1
 
-            clip_metadata_records.append({
+            metadata_entry = {
                 "file_name": file_name,
                 "startPosition": raw_start_pos,
                 "endPosition": clip_entry.get("endPosition"),
                 "note": note_name
-            })
+            }
+            if chapter_match:
+                metadata_entry["chapterTitle"] = chapter_title
+                metadata_entry["chapterIndex"] = chapter_match.get("index")
+            clip_metadata_records.append(metadata_entry)
 
         self._save_clip_metadata(clips_dir_path, clip_metadata_records)
 
@@ -754,6 +767,175 @@ class AudibleAPI:
             print(f"Saved clip metadata to {metadata_path}")
         except OSError as exc:
             print(f"Failed to write clip metadata: {exc}")
+
+    def _fetch_chapter_info(self, asin):
+        if not asin:
+            return None
+        request_body = {
+            "supported_drm_types": ["Mpeg", "Adrm"],
+            "quality": "Normal",
+            "consumption_type": "Download",
+            "response_groups": "chapter_info"
+        }
+        try:
+            with audible.Client(auth=self.auth) as client:
+                response = client.post(f"/1.0/content/{asin}/licenserequest", request_body)
+        except Exception as exc:
+            print(f"Unable to fetch chapter metadata for {asin}: {exc}")
+            return None
+
+        content_metadata = ((response or {}).get("content_license") or {}).get("content_metadata") or {}
+        return content_metadata.get("chapter_info")
+
+    def _persist_chapter_timestamps(self, book_payload, title_dir_path, explicit_chapter_info=None):
+        if not isinstance(book_payload, dict):
+            return
+        item = book_payload.get("item") or {}
+        chapter_info = explicit_chapter_info or item.get("chapter_info")
+        chapters = self._normalize_chapter_timestamps(chapter_info)
+        if not chapters:
+            return
+
+        payload = {
+            "asin": item.get("asin"),
+            "retrieved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "chapters": chapters
+        }
+
+        chapters_path = os.path.join(title_dir_path, "chapter_timestamps.json")
+        try:
+            with open(chapters_path, "w", encoding="utf-8") as chapter_file:
+                json.dump(payload, chapter_file, indent=2, ensure_ascii=False)
+            print(f"Saved {len(chapters)} chapter timestamps to {chapters_path}")
+        except OSError as exc:
+            print(f"Failed to write chapter timestamps: {exc}")
+
+    def _load_chapter_timestamps(self, title_dir_path):
+        chapters_path = os.path.join(title_dir_path, "chapter_timestamps.json")
+        if not os.path.exists(chapters_path):
+            return None
+        try:
+            with open(chapters_path, "r", encoding="utf-8") as chapter_file:
+                return json.load(chapter_file)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _normalize_chapter_timestamps(self, chapter_info):
+        if not isinstance(chapter_info, dict):
+            return None
+        raw_chapters = chapter_info.get("chapters")
+        if not isinstance(raw_chapters, list):
+            return None
+
+        normalized = []
+        for index, chapter in enumerate(raw_chapters, start=1):
+            if not isinstance(chapter, dict):
+                continue
+            start_ms = self._coerce_int(
+                chapter.get("start_offset_ms")
+                or chapter.get("start_offset")
+                or chapter.get("startOffsetMs")
+                or chapter.get("startPosition")
+                or chapter.get("start_position_ms")
+            )
+            end_ms = self._coerce_int(
+                chapter.get("end_offset_ms")
+                or chapter.get("end_offset")
+                or chapter.get("endOffsetMs")
+                or chapter.get("endPosition")
+                or chapter.get("end_position_ms")
+            )
+            length_ms = self._coerce_int(
+                chapter.get("length_ms")
+                or chapter.get("length")
+                or chapter.get("duration_ms")
+                or chapter.get("chapter_length_ms")
+            )
+            if end_ms is None and start_ms is not None and length_ms is not None:
+                end_ms = start_ms + length_ms
+
+            normalized.append({
+                "index": index,
+                "title": chapter.get("title") or f"Chapter {index}",
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "length_ms": length_ms
+            })
+
+        return normalized or None
+
+    def _coerce_int(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+        try:
+            return int(float(str(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_chapter_for_timestamp(self, chapter_payload, position_ms):
+        if chapter_payload is None:
+            return None
+        try:
+            position = int(position_ms)
+        except (TypeError, ValueError):
+            return None
+
+        if isinstance(chapter_payload, dict):
+            chapters = chapter_payload.get("chapters")
+        elif isinstance(chapter_payload, list):
+            chapters = chapter_payload
+        else:
+            return None
+
+        if not isinstance(chapters, list):
+            return None
+
+        best_match = None
+        for chapter in chapters:
+            if not isinstance(chapter, dict):
+                continue
+            start_ms = self._coerce_int(
+                chapter.get("start_ms")
+                or chapter.get("startPosition")
+                or chapter.get("start_offset_ms")
+            )
+            if start_ms is None:
+                continue
+            end_ms = self._coerce_int(
+                chapter.get("end_ms")
+                or chapter.get("endPosition")
+                or chapter.get("end_offset_ms")
+            )
+
+            best_match = chapter
+            if end_ms is not None and position < end_ms:
+                return chapter
+
+        return best_match
+
+    def _format_clip_filename(self, base_name, chapter_title):
+        if not chapter_title:
+            return base_name
+        chapter_component = self._sanitize_filename_component(chapter_title)
+        if not chapter_component:
+            return base_name
+        return f"{base_name}__{chapter_component}"
+
+    def _sanitize_filename_component(self, value):
+        if not value:
+            return ""
+        value = value.strip()
+        if not value:
+            return ""
+        sanitized = re.sub(r"[\\/:*?\"<>|]", "", value)
+        sanitized = re.sub(r"\s+", "_", sanitized)
+        sanitized = sanitized.strip("._")
+        return sanitized or "chapter"
 
     def fuzzy_search_pdf(self, pdf_path, query, threshold=0.6, max_results=5):
         query_clean = query.strip()

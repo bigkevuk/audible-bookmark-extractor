@@ -36,6 +36,8 @@ Currently, the tool supports exporting to Excel and [Readwise](https://readwise.
 - After transcribing, run `search_pdf` to list your books, choose one, and map every clip transcription to the best matching EPUB section (when available) and PDF page. Results are saved to `<book_root>/clip_pdf_references.json`, and processed transcription files move into `extracted text/processed/`.
 - You can still run ad-hoc lookups with `search_pdf --query="some text"` (optional `--threshold` and `--max_results`) to print the top fuzzy matches.
 - Documents are cached after the first scan, so repeated searches stay fast until the source files change.
+- When you download a book, we now capture Audible's `chapter_info` payload (start/end offsets per chapter) and cache it to `<book_root>/chapter_timestamps.json` for later alignment with EPUB/PDF matches or any downstream tooling.
+- During `get_bookmarks`, each exported clip filename is suffixed with its chapter title (using `chapter_timestamps.json`) so you can spot the surrounding context at a glance.
 
 ## Authentication
 
