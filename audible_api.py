@@ -1,3 +1,5 @@
+"""Core business logic for downloading, slicing, and transcribing audiobooks."""
+
 import os
 import json
 import sys
@@ -41,13 +43,17 @@ END_POSITION_OFFSET = 0
 
 class AudibleAPI:
 
+    """Wrapper around the audible client plus local helper routines."""
+
     def __init__(self, auth):
+        """Store the authenticator returned by the audible SDK."""
         self.auth = auth
         self.books = []
         self.library = {}
 
     @classmethod
     async def authenticate(self) -> "AudibleAPI":
+        """Prompt the user for credentials, persist them, and return a client."""
         secrets_dir_path = os.path.join(artifacts_root_directory, "secrets")
         credentials_path = os.path.join(secrets_dir_path, "credentials.json")
         if os.path.exists(credentials_path):
@@ -72,6 +78,7 @@ class AudibleAPI:
 
     # Gets information about a book
     async def get_book_infos(self, asin):
+        """Return the verbose metadata block for a single book ASIN."""
         async with audible.AsyncClient(self.auth) as client:
             try:                
                 book = await client.get(
@@ -93,7 +100,7 @@ class AudibleAPI:
 
     # Helper function for displaying the users books and allowing them to select one based on the index number
     async def get_book_selection(self):
-
+        """Display the current library and capture a single or bulk selection."""
         if not self.library:
             await self.get_library()
 
@@ -121,6 +128,7 @@ class AudibleAPI:
 
     # Main download books function
     async def cmd_download_books(self):
+        """Download each selected audiobook to the artifacts directory."""
         li_books = await self.get_book_selection()
 
         tasks = []
@@ -190,15 +198,18 @@ class AudibleAPI:
 
     # WIP
     def generate_url(self, country_code, url_type, asin=None):
+        """Build the Audible download URL for a locale + ASIN combo."""
         if asin and url_type == "download":
             return f"{AUDIBLE_URL_BASE}{country_code_mapping.get(country_code)}/library/download?asin={asin}&codec=AAX"
 
     # Need the next_request for Audible API to give us the download link for the book
     def get_download_link_callback(self, resp):
+        """audible.Client callback that exposes the final signed download URL."""
         return resp.next_request
 
     # Sends a request to get the download link for the selected book
     def get_download_url(self, url, **kwargs):
+        """Call the Audible library endpoint to receive a signed download link."""
 
         with audible.Client(auth=self.auth, response_callback=self.get_download_link_callback) as client:
             library = client.get(
@@ -208,6 +219,7 @@ class AudibleAPI:
             return library.url
 
     async def cmd_list_books(self):
+        """Print every title currently available in the authenticated library."""
         if not self.books:
             await self.cmd_show_library()
 
@@ -215,6 +227,7 @@ class AudibleAPI:
         
     # Gets all books and info for account and adds it to self.books, also returns ASIN for all books
     async def get_library(self):
+        """Populate the local cache of books and return a list of ASINs."""
         async with audible.AsyncClient(self.auth) as client:
             self.library = await client.get(
                 path="library",
@@ -232,6 +245,7 @@ class AudibleAPI:
             return asins
 
     async def cmd_show_library(self):
+        """Print the cached library list, fetching it first if needed."""
         if not self.books:
             await self.get_library()
 
@@ -240,12 +254,14 @@ class AudibleAPI:
    
 
     async def cmd_get_bookmarks(self):
+        """Fetch bookmark metadata for the selected books."""
         li_books = await self.get_book_selection()
 
         for book in li_books:
             print(self.get_bookmarks(book))
 
     def get_bookmarks(self, book):
+        """Slice highlights and export clips plus metadata for a single book."""
         asin = book.get("asin")
         _title = book.get("title", {}).get("title", 'untitled')
         if not _title:
@@ -314,6 +330,7 @@ class AudibleAPI:
                     file_counter += 1
 
     async def cmd_convert_audiobook(self):
+        """Remove Audible DRM and export slices in both M4B and MP3 formats."""
         # FFMPEG needs to be installed for this step! see readme for more details
         li_books = await self.get_book_selection()
 
@@ -339,6 +356,7 @@ class AudibleAPI:
                 f"ffmpeg -i {title_m4b_path} {title_mp3_path}")
 
     async def cmd_transcribe_bookmarks(self, openai_api_key=None):
+        """Transcribe clipped bookmarks with OpenAI Whisper or Google SR."""
         li_books = await self.get_book_selection()
 
         # Initialize OpenAI client if API key is provided, otherwise fall back to Google
@@ -459,6 +477,7 @@ class AudibleAPI:
                 json.dump(jsonHighlights, f, indent=4)                
 
     def get_activation_bytes(self):
+        """Cache and return the DRM activation bytes for the current account."""
 
         activation_bytes_path = os.path.join(artifacts_root_directory, "secrets", "activation_bytes.txt")
         # we already have activation bytes
@@ -477,4 +496,5 @@ class AudibleAPI:
         return activation_bytes
 
     def bookmark_response_callback(self, resp):
+        """Return the raw bookmark response for manual processing."""
         return resp

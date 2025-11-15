@@ -1,9 +1,13 @@
+"""High-level command router for the Audible Bookmark Extractor CLI."""
+
+from typing import Optional
+
+import audible
+
 from audible_api import AudibleAPI
 from constants import artifacts_root_directory
-from readwise import Readwise
 from openai_config import OpenAIConfig
-from typing import Optional
-import audible
+from readwise import Readwise
 
 help_dict = {
     "authenticate": "Logs in to Audible and stores credentials locally to be re-used",
@@ -21,17 +25,22 @@ help_dict = {
 AUTHLESS_COMMANDS = ["help", "quit", "exit", "authenticate", "readwise_authenticate", "openai_authenticate"]
 
 class Command:
+
+  """Handles user interaction and delegates work to integrations."""
         
   def __init__(self):
+      """Set placeholders for API helpers that require authentication."""
       self.audible_obj: Optional[AudibleAPI] = None
       self.readwise_obj: Optional[Readwise] = None
       self.openai_obj: Optional[OpenAIConfig] = None  
   
   def show_help(self):
+      """Print a short description for every supported command."""
       for key in help_dict:
         print(f"{key} -- {help_dict[key]}")
 
   def welcome(self):
+    """Load previously saved credentials and display onboarding info."""
     # authenticate with login
     try:
         credentials = audible.Authenticator.from_file(f"{artifacts_root_directory}/secrets/credentials.json")
@@ -61,6 +70,7 @@ class Command:
     print("Enter help for a list of commands")
     
   async def command_loop(self):
+    """Prompt the user for input and execute the routed command."""
     command_input = input("\n\nEnter command: ")
     command = command_input.split(" ")[0]
     additional_kwargs = command_input.replace(command, '')
@@ -106,10 +116,13 @@ class Command:
   
   # Callbacks
   async def invalid_command_callback(self):
+      """Display a friendly error for unknown commands."""
       print("Invalid command, try again")      
 
   async def invalid_kwarg_callback(self):
+      """Warn the user when kwargs are malformed."""
       print("Invalid command or arguments supplied, try again")      
     
   async def invalid_auth_callback(self):
+      """Explain that authentication is required before running Audible commands."""
       print("Invalid Audible credentials, run authenticate and try again")      

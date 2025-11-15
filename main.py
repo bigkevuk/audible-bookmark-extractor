@@ -1,7 +1,10 @@
+"""CLI entry point for the Audible Bookmark Extractor application."""
+
 import asyncio
 from command import Command
 
 async def main():
+    """Kick off the interactive command loop and gracefully exit on Ctrl+C."""
     cmd = Command()
     cmd.welcome()
     try:

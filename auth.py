@@ -1,3 +1,5 @@
+"""Small helpers for handling explicit Audible authentication flows."""
+
 import audible
 import httpx
 
@@ -24,6 +26,7 @@ import httpx
 
 
 def authorize_audible(audible_email, audible_password, locale, captcha_callback):
+    """Perform a username/password login and return a persisted authenticator."""
     # Authorize and register in one step
     auth = audible.Authenticator.from_login(
         audible_email,

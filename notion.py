@@ -1,9 +1,15 @@
+"""Minimal Notion API exporter stub."""
+
 import requests
 import os
 from datetime import datetime
 
 class NotionExporter:
+    """Send extracted highlights to a target Notion database."""
+
+    @staticmethod
     def post_notion(text_heading, text_content):
+        """Publish a highlight to Notion using environment-based credentials."""
         token = os.environ.get("NOTION_TOKEN")
         url = "https://api.notion.com/v1/pages"
 
